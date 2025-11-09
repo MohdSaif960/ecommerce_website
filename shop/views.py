@@ -233,38 +233,95 @@ def checkout_view(request):
         'addresses': addresses,
         'total': total
     })"""
+# ----------------------------
+# CHECKOUT VIEW (FIXED)
+# ----------------------------
 @login_required
 def checkout_view(request):
-    product_id = request.GET.get("product_id")
-    addresses = Address.objects.filter(user=request.user)
+    """
+    Checkout View – Handles both 'Buy Now' and normal 'Cart' checkout.
+    Keeps Buy Now data across reloads and after address add/update.
+    """
 
+    # ---------------------------------
+    # 🧹 1. Clear old Buy Now session if coming from unrelated pages
+    # ---------------------------------
+    if 'buy_now_data' in request.session and not request.GET.get("product_id"):
+        ref = request.META.get('HTTP_REFERER', '')
+        from_page = request.GET.get('from')  # ✅ NEW FLAG CHECK
+
+        # ❌ Delete session only if NOT returning from address pages
+        if not from_page and all(x not in ref for x in ['/product/', '/buy-now', '/checkout', '/address_add', '/address_update']):
+            del request.session['buy_now_data']
+            request.session.modified = True
+
+    addresses = Address.objects.filter(user=request.user)
+    product_id = request.GET.get("product_id")
+
+    # ---------------------------------
+    # 🛒 2. BUY NOW FLOW
+    # ---------------------------------
     if product_id:
-        # ✅ Buy Now flow
         product = get_object_or_404(Product, id=product_id)
-        quantity = int(request.GET.get("quantity", 1))   # ✅ yaha se quantity le
-        size = request.GET.get("size")  # ✅ size from query param
+        quantity = int(request.GET.get("quantity", 1))
+        size = request.GET.get("size")
 
         # 🔹 Stock check
+        if product.stock < 1:
+            messages.error(request, f"Sorry, {product.name} is out of stock.")
+            return redirect('shop')
+
         if quantity > product.stock:
-            messages.error(request, f"Not enough stock. Only {product.stock} left.")
-            quantity = product.stock  # optional: limit quantity to stock
-            #return redirect('checkout')
+            messages.warning(request, f"Only {product.stock} units left. Quantity adjusted.")
+            quantity = product.stock
 
         price = product.discount_price or product.price
-        total = price * quantity
+        total = float(price) * quantity
+
+        # 🔹 Save Buy Now data in session
+        request.session['buy_now_data'] = {
+            'product_id': product.id,
+            'quantity': quantity,
+            'size': size,
+            'total': total
+        }
+        request.session.modified = True
 
         return render(request, 'shop/checkout.html', {
             'single_product': product,
-            'single_quantity': quantity,   # ✅ clear name so cart flow me clash na ho
+            'single_quantity': quantity,
+            'single_size': size,
             'addresses': addresses,
-            'total': total,
-            'single_size': size
+            'total': total
         })
 
-    # ✅ Normal cart checkout
-    cart = get_object_or_404(Cart, user=request.user)
+    # ---------------------------------
+    # 🔁 3. PAGE RELOAD or RETURN FROM ADDRESS PAGE
+    # ---------------------------------
+    elif 'buy_now_data' in request.session:
+        data = request.session['buy_now_data']
+        product = get_object_or_404(Product, id=data['product_id'])
+        return render(request, 'shop/checkout.html', {
+            'single_product': product,
+            'single_quantity': data['quantity'],
+            'single_size': data['size'],
+            'addresses': addresses,
+            'total': data['total']
+        })
+
+    # ---------------------------------
+    # 🧺 4. NORMAL CART CHECKOUT
+    # ---------------------------------
+    cart, _ = Cart.objects.get_or_create(user=request.user)
     items = cart.items.all()
     total = sum(item.total_price for item in items)
+
+    if not items.exists():
+        messages.info(request, "Your cart is empty.")
+        return render(request, 'shop/checkout.html', {
+            'addresses': addresses,
+            'no_items': True
+        })
 
     return render(request, 'shop/checkout.html', {
         'cart': cart,
@@ -273,8 +330,9 @@ def checkout_view(request):
         'total': total
     })
 
+
 # ----------------------------
-# Add Address
+# ADD ADDRESS (FIXED)
 # ----------------------------
 @login_required
 def address_add_view(request):
@@ -286,6 +344,7 @@ def address_add_view(request):
         state = request.POST.get('state')
         landmark = request.POST.get('landmark')
         address_line = request.POST.get('address_line')
+
         Address.objects.create(
             user=request.user,
             full_name=full_name,
@@ -296,24 +355,23 @@ def address_add_view(request):
             landmark=landmark,
             address_line=address_line
         )
-        messages.success(request, "Address added.")
-        return redirect('checkout')
+
+        messages.success(request, "Address added successfully!")
+
+        # ✅ Preserve Buy Now session and redirect with flag
+        return redirect('/checkout?from=address_add')
+
     return render(request, 'shop/address_add.html')
 
 
-
-
-
 # ----------------------------
-# Update Address
+# UPDATE ADDRESS (FIXED)
 # ----------------------------
 @login_required
 def address_update_view(request, pk):
-    # ensure only owner can edit
     address = get_object_or_404(Address, pk=pk, user=request.user)
 
     if request.method == 'POST':
-        # get updated values from form
         address.full_name = request.POST.get('full_name')
         address.phone_number = request.POST.get('phone_number')
         address.pincode = request.POST.get('pincode')
@@ -321,20 +379,22 @@ def address_update_view(request, pk):
         address.state = request.POST.get('state')
         address.landmark = request.POST.get('landmark')
         address.address_line = request.POST.get('address_line')
-
         address.save()
-        messages.success(request, "Address updated.")
-        return redirect('checkout')   # ya jahan redirect karna chahte ho
 
-    # GET -> show form with existing data (reuse same template or separate)
+        messages.success(request, "Address updated successfully!")
+        # ✅ Preserve Buy Now session and redirect with flag
+        return redirect('/checkout?from=address_update')
+
     return render(request, 'shop/update.html', {'address': address})
 
 
-
 # ----------------------------
-# Place Order
+# PLACE ORDER VIEW (UNCHANGED)
 # ----------------------------
-from django.core.mail import send_mail
+# ----------------------------
+# PLACE ORDER VIEW (FIXED EMAIL)
+# ----------------------------
+from django.core.mail import send_mail, BadHeaderError
 from django.conf import settings
 
 @login_required
@@ -342,105 +402,138 @@ def place_order_view(request):
     if request.method == 'POST':
         address_id = int(request.POST.get('address'))
         address = get_object_or_404(Address, id=address_id, user=request.user)
+        product_id = request.POST.get('product_id')
+        size = request.POST.get('size')
+        quantity = int(request.POST.get('quantity', 1))
 
-        product_id = request.POST.get('product_id')  # check if Buy Now hai
-        size = request.POST.get('size')  # ✅ size receive
-        quantity = int(request.POST.get('quantity', 1))  # ✅ get actual quantity
-
+        # ------------------------------------------------------
+        # ✅ BUY NOW FLOW
+        # ------------------------------------------------------
         if product_id:
-            # ----------------------------
-            # Buy Now Flow
-            # ----------------------------
             product = get_object_or_404(Product, id=product_id)
-
-            # ✅ stock check
-            if product.stock < 1:
-                messages.error(request, f"Sorry, {product.name} is out of stock.")
+            if product.stock < quantity:
+                messages.error(request, f"Only {product.stock} left of {product.name}.")
                 return redirect('checkout')
 
-            # ✅ order create
             order = Order.objects.create(
                 user=request.user,
                 address=address,
                 total_amount=product.final_price * quantity
             )
 
-            # ✅ order item create
             OrderItem.objects.create(
                 order=order,
                 product=product,
-                quantity=quantity,  # Buy Now = single product
+                quantity=quantity,
                 price=product.final_price,
-                size=size # ✅ Added size
+                size=size
             )
 
-            # ✅ stock reduce
-            product.stock -=  quantity   # ✔️ ab jitna order hua utna kam hoga
+            product.stock -= quantity
             product.save()
 
-            # ----------------------------
-            # SEND EMAIL NOTIFICATION
-            # ----------------------------
-            subject = f"New Order by {request.user.username} - Order ID #{order.id}"
-            message = f"User: {request.user.username}\nEmail: {request.user.email}\nProduct: {product.name}\nQuantity: {quantity}\nSize: {size}\nTotal Amount: {order.total_amount}"
-            recipient_list = ['mohdsaif88824923@gmail.com']  # yaha apna email daalo
-            send_mail(subject, message, settings.EMAIL_HOST_USER, recipient_list)
+            # ✅ Clear Buy Now session
+            if 'buy_now_data' in request.session:
+                del request.session['buy_now_data']
+                request.session.modified = True
 
+            # ✅ FIXED EMAIL SECTION
+            try:
+                subject = f"Order #{order.id} placed successfully!"
+                message = (
+                    f"👤 User: {request.user.username}\n"
+                    f"📦 Product: {product.name}\n"
+                    f"🔢 Quantity: {quantity}\n"
+                    f"📏 Size: {size}\n"
+                    f"💰 Total: ₹{order.total_amount}\n\n"
+                    f"Shipping Address:\n{address.full_name}, {address.address_line}, {address.city}, {address.state} - {address.pincode}\n📞 {address.phone_number}"
+                )
+
+                send_mail(
+                    subject=subject,
+                    message=message,
+                    from_email=settings.DEFAULT_FROM_EMAIL,  # ✅ More reliable
+                    recipient_list=['mohdsaif88824923@gmail.com'],
+                    fail_silently=False,  # ✅ show error if any
+                )
+            except BadHeaderError:
+                print("❌ Invalid header found while sending mail.")
+            except Exception as e:
+                print("❌ Email error:", e)
+
+            response = redirect('order_success', order_id=order.id)
+            response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            response['Pragma'] = 'no-cache'
+            response['Expires'] = '0'
             messages.success(request, "Order placed successfully!")
-            return redirect('order_success', order_id=order.id)
+            return response
 
+        # ------------------------------------------------------
+        # ✅ NORMAL CART FLOW
+        # ------------------------------------------------------
         else:
-            # ----------------------------
-            # Normal Cart Flow
-            # ----------------------------
             cart = get_object_or_404(Cart, user=request.user)
             items = cart.items.all()
-            total = sum(item.total_price for item in items)
 
-            # ✅ order create
+            if not items.exists():
+                messages.warning(request, "Your cart is empty.")
+                return redirect('cart')
+
+            total = sum(item.total_price for item in items)
             order = Order.objects.create(
                 user=request.user,
                 address=address,
-                total_amount=total * quantity
+                total_amount=total
             )
 
             for item in items:
-                # ✅ stock check
                 if item.product.stock < item.quantity:
                     messages.error(request, f"Not enough stock for {item.product.name}.")
-                    order.delete()  # agar stock kam hai to order cancel kar do
+                    order.delete()
                     return redirect('checkout')
 
-                # ✅ order item create
                 OrderItem.objects.create(
                     order=order,
                     product=item.product,
                     quantity=item.quantity,
                     price=item.product.final_price,
-                    size = item.size  # ✅ Added size from CartItem
+                    size=item.size
                 )
 
-                # ✅ stock reduce
                 item.product.stock -= item.quantity
                 item.product.save()
 
-            # ----------------------------
-            # SEND EMAIL NOTIFICATION FOR CART ORDERS
-            # ----------------------------
-            subject = f"New Order by {request.user.username} - Order ID #{order.id}"
-            message = f"User: {request.user.username}\nEmail: {request.user.email}\nTotal Amount: {order.total_amount}\nProducts:\n"
-            for item in items:
-                message += f"- {item.product.name} | Quantity: {item.quantity} | Size: {item.size}\n"
-            recipient_list = ['mohdsaif88824923@gmail.com']  # yaha apna email daalo
-            send_mail(subject, message, settings.EMAIL_HOST_USER, recipient_list)
-
-            # ✅ cart empty
+            # ✅ Empty cart after successful order
             cart.items.all().delete()
+            cart.delete()
+
+            # ✅ FIXED EMAIL SECTION
+            try:
+                subject = f"Order #{order.id} placed successfully!"
+                message = f"👤 User: {request.user.username}\n💰 Total Amount: ₹{order.total_amount}\n\nOrdered Items:\n"
+                for item in items:
+                    message += f"- {item.product.name} (x{item.quantity}) Size: {item.size}\n"
+
+                send_mail(
+                    subject=subject,
+                    message=message,
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=['mohdsaif88824923@gmail.com'],
+                    fail_silently=False,
+                )
+            except BadHeaderError:
+                print("❌ Invalid header found while sending mail.")
+            except Exception as e:
+                print("❌ Email error:", e)
+
+            response = redirect('order_success', order_id=order.id)
+            response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            response['Pragma'] = 'no-cache'
+            response['Expires'] = '0'
             messages.success(request, "Order placed successfully!")
-            return redirect('order_success', order_id=order.id)
+            return response
 
     return redirect('checkout')
-
 
 # ----------------------------
 # Order Success Page
